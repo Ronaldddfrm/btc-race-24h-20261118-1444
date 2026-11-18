@@ -6,7 +6,8 @@
 // 2-hour (120-bar) simple moving average of closes: when the close dips 1.2% below
 // that average it buys all-in, and it sells everything when the close recovers to
 // 0.9% above the average. A waterfall guard sells everything if the position falls
-// 1.5% under its cost. It never buys in the final hour of the window, because there
+// 1.5% under its cost. The dip must hold for 2 consecutive bars before buying, so a
+// single-bar wick that immediately reverses never triggers a trade. It never buys in the final hour of the window, because there
 // is no time left for a reversion to play out before the final flatten. Long only,
 // one open position at most, fully deterministic: every decision is a pure function
 // of the bars seen, with integer arithmetic throughout.
@@ -25,6 +26,7 @@ const SMA_BARS = 120; // 2-hour simple moving average of closes
 const DIP_NUM = 988; // buy when close * 1000 < sma * 988 (1.2% below the average)
 const EXIT_NUM = 1009; // sell when close * 1000 > sma * 1009 (0.9% above the average)
 const STOP_NUM = 985; // sell when position value * 1000 < cost * 985 (1.5% under cost)
+const DIP_CONFIRM_BARS = 2; // buy only once the dip has held for 2 consecutive bars
 const MIN_BARS = 60; // minimum bars of history before the first trade
 const TOTAL_BARS = 1440; // scored window length: 24h of 1-minute bars
 const NO_BUY_AFTER = TOTAL_BARS - 60; // no new buys in the final hour
@@ -33,6 +35,8 @@ const MAX_SLIPPAGE_BPS = 200; // generous bound; the fill model charges ~2 bps +
 // Rolling window of closes (raw units, price_scale 5) and their running sum.
 const closes: bigint[] = [];
 let rollingSum = 0n;
+// Consecutive bars the dip condition has held; a one-bar wick never triggers a buy.
+let dipStreak = 0;
 
 function average(): bigint | null {
   if (closes.length < SMA_BARS) return null;
@@ -53,12 +57,16 @@ await runBars({
     if (closes.length < Math.max(MIN_BARS, SMA_BARS)) return [];
     const avg = average();
     if (avg === null || avg === 0n) return [];
+    // Track whether the dip is a sustained move or a single-bar spike.
+    const isDip = close * 1000n < avg * BigInt(DIP_NUM);
+    dipStreak = isDip ? dipStreak + 1 : 0;
     const scoredIdx = state.seq - state.warmupBars;
     const pos = state.positions.get(SYMBOL);
     if (pos === undefined || pos.qty === 0n) {
-      // Flat: buy all-in on a dip below the average, unless the window is nearly over.
+      // Flat: buy all-in on a dip below the average that has held for
+      // DIP_CONFIRM_BARS bars, unless the window is nearly over.
       if (scoredIdx >= NO_BUY_AFTER) return [];
-      if (close * 1000n < avg * BigInt(DIP_NUM)) {
+      if (isDip && dipStreak >= DIP_CONFIRM_BARS) {
         const room = state.weightRoom(SYMBOL);
         const spend = state.cash < room ? state.cash : room;
         if (spend <= 0n) return [];
